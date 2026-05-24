@@ -53,10 +53,22 @@ cat >> "$PROTOCOL" << 'PYEOF'
 import threading as _scrub_threading
 
 _SCRUB_PATTERNS = (
+    # Claude-Code-grammar XML closers (not in MiMo's tool-call format).
     "</parameter>",
     "</invoke>",
     "</function_calls>",
     "<function_calls>",
+    # MiMo's OWN tool-call grammar closers. Inside a real <tool_call>...
+    # </tool_call> block the qwen3xml tool parser consumes these and emits
+    # structured tool_call deltas — they NEVER reach delta.content. If they
+    # show up here, they are orphan hallucinations (observed in Droid
+    # session a76c2f9e on 2026-05-24: model trailed off a long content
+    # response with `\n</function>\n</tool_call>` after writing a forum
+    # post draft, even though no <tool_call> opener was emitted).
+    "</function>",
+    "</tool_call>",
+    # Anthropic math-italic </thinking> close variants
+    # (training-contamination residue):
     "</\U0001D44E\U0001D45B\U0001D461\U0001D45A\U0001D459:thinking>",
     "</\U0001D44E\U0001D45B\U0001D461\U0001D45A�>",
     "</\U0001D44E�>",
