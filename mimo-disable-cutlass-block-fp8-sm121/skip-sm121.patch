@@ -1,0 +1,25 @@
+--- a/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/cutlass.py
+@@ -244,6 +244,22 @@
+                 "The device compute capability of"
+                 f"{compute_capability} is not supported.",
+             )
++        # MOD (4x-spark-cluster): CUTLASS block-FP8 dispatch routes sm_120+
++        # to cutlass_scaled_mm_sm120, but the compiled kernel rejects
++        # sm_121a (GB10/DGX Spark) at runtime in cutlass_gemm_caller.cuh:51
++        # CUTLASS_CHECK(can_implement). Force fallback to Triton kernel.
++        if compute_capability is None:
++            from vllm.platforms import current_platform as _cp
++            _cap = _cp.get_device_capability()
++            if _cap is not None:
++                compute_capability = _cap.to_int()
++        if compute_capability is not None and 120 <= compute_capability < 130:
++            return (
++                False,
++                "CUTLASS block-FP8 sm_120 kernel rejects sm_121a at runtime "
++                "(cutlass_gemm_caller.cuh:51 Invalid status); falling back "
++                "to TritonFp8BlockScaledMMKernel.",
++            )
+         return True, None
+ 
+     @classmethod
