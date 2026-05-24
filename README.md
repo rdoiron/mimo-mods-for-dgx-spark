@@ -13,6 +13,7 @@ These mods address compatibility issues encountered when deploying MiMo-V2.5 on 
 5. **Tool call delta fixes** – Removes problematic `name=null` emissions and empty tool calls
 6. **Claude thinking close recognition** – Improves reasoning end detection for Claude-style thinking
 7. **Empty tool call stripping** – Filters out incomplete tool call deltas
+8. **Claude XML leakage scrubbing** – Strips Anthropic-leaked closing tags from streamed content/reasoning
 
 ## Installation
 
@@ -49,11 +50,14 @@ bash mods/mimo-emit-reasoning-content/run.sh
 # 5. Tool call delta fixes (removes name=null, deduplicates)
 bash mods/mimo-fix-tool-call-deltas/run.sh
 
-# 6. Claude thinking close recognition (better reasoning end detection)
-bash mods/mimo-recognize-claude-thinking-close/run.sh
+# 6. Claude thinking close recognition — SKIP (defunct, see section 6 below)
+#    bash mods/mimo-recognize-claude-thinking-close/run.sh
 
 # 7. Empty tool call stripping (filters incomplete tool calls)
 bash mods/mimo-strip-empty-tool-calls/run.sh
+
+# 8. Claude XML leakage scrubbing (strips </parameter>, </invoke>, math-italic antml)
+bash mods/mimo-scrub-claude-xml-leakage/run.sh
 ```
 
 ## Prerequisites
@@ -95,8 +99,29 @@ bash mods/mimo-strip-empty-tool-calls/run.sh
 **Problem**: Parser emits `name=null` in continuation deltas, confusing strict validators  
 **Solution**: Strips `name=None` from tool-call deltas and deduplicates immediate duplicate argument fragments  
 
-### 6. mimo-recognize-claude-thinking-close
+### 6. mimo-recognize-claude-thinking-close — ⚠️ DEFUNCT, kept for reference
 
-**Purpose**: Improves reasoning end detection for Claude-style thinking  
-**Problem**: Naive detection incorrectly marks paired template examples as reasoning endings  
-**Solution**: Implements pair-check heuristics for `</think>` and `
+**Status**: **NOT INCLUDED** in production `startmimo.sh`. Disabled 2026-05-23. Kept in the repo so anyone re-attempting this approach has the prior art and the failure analysis.
+
+**Original purpose**: Teach vLLM's qwen3 reasoning parser about Anthropic-style thinking closers (canonical `</think>`, math-italic `</𝑎𝑛𝑡𝑚𝑙:thinking>`, ASCII namespaced `</thinking>`) that MiMo-V2.5 emits as artifacts of training-data leakage, so they cleanly terminate the reasoning channel instead of leaking into visible content.
+
+**Why it doesn't work as written**: V8 added a guard requiring a `<think>` opener inside the `input_ids` slice before declaring reasoning ended (to avoid false positives on chat-template tool-call examples). But vLLM's parser orchestrator (`vllm/parser/abstract_parser.py:parse_delta`) calls `is_reasoning_end` on the **per-delta token slice** — a handful of tokens at a time, *never* containing the request's `<think>` opener. The guard therefore always returns `False`, `state.reasoning_ended` stays `False` forever, the orchestrator never hands off to the tool parser, and Droid/OpenCode tool calls come through as raw XML inside the content channel.
+
+**What we use instead**:
+1. `repetition_penalty=1.2` in `--override-generation-config` (HF discussion #6, S1quence's reply 3) — keeps the Unicode-contamination thought-loop from running away in the first place
+2. `mimo-scrub-claude-xml-leakage` (below) — strips any residual `</parameter>`, `</invoke>`, math-italic antml-close tags that the sampling penalty doesn't catch, from the streamed SSE `delta.content` / `delta.reasoning_content`
+
+**If you want to revive it**: the right fix is at the orchestrator boundary — either feed cumulative `input_ids` into `is_reasoning_end` so the opener stays visible, or move closer-detection into `is_reasoning_end_streaming` (where the parser already keeps cumulative `current_text`). The text-based suffix-scan primitives in `_mod_extract_reasoning_streaming` are fine; only the `is_reasoning_end` hook is broken.
+
+### 7. mimo-strip-empty-tool-calls
+
+**Purpose**: Drops incomplete tool-call deltas (no name, no arguments) before the SSE wire
+**Problem**: Wrap-up deltas with `id`+`type` but no `name` violate strict AI-SDK Zod schemas (OpenCode breaks)
+**Solution**: Patches `ChatCompletionStreamResponse.model_dump_json` to filter empty entries from `delta.tool_calls`
+
+### 8. mimo-scrub-claude-xml-leakage
+
+**Purpose**: Strip Claude-grammar XML closers and Anthropic-thinking close-tag residue that leak into `delta.content` and `delta.reasoning_content`
+**Problem**: MiMo-V2.5's training mix contains Anthropic-conversation leakage. The model intermittently emits `</parameter>`, `</invoke>`, `</function_calls>` into the content channel and corrupted math-italic forms like `</𝑎𝑛𝑡𝑚𝑙:thinking>`, `</𝑎𝑛𝑡𝑚�>`, `</𝑎�>` (U+FFFD) into the reasoning channel
+**Solution**: Wraps `ChatCompletionStreamResponse.model_dump_json` with a tag-scrubbing serializer. Maintains a per-`(request_id, field)` tail buffer so tags split across SSE chunks still get caught. Tags inside legitimate `<tool_call>` blocks are unaffected — by the time content reaches this hook, the tool-call parser has already consumed real tool calls
+**Known limit**: This will also strip these tag literals from code/documentation output. Acceptable trade-off for our use cases (coding agents, not Claude-format docs)

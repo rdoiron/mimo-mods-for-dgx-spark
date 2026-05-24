@@ -1,6 +1,49 @@
 #!/bin/bash
 # Mod: mimo-recognize-claude-thinking-close (V8)
 #
+# ###############################################################################
+# # DEFUNCT — NOT USED IN PRODUCTION (disabled 2026-05-23)                      #
+# #                                                                             #
+# # Kept in the repo for reference and as a starting point if anyone wants to   #
+# # re-attempt this approach. The current `startmimo.sh` does NOT include a     #
+# # --apply-mod entry for this mod.                                             #
+# #                                                                             #
+# # Why disabled:                                                               #
+# #   The intent was to teach the qwen3 reasoning parser about Anthropic-style  #
+# #   thinking closers (canonical </think>, math-italic </𝑎𝑛𝑡𝑚𝑙:thinking>,  #
+# #   etc.) that MiMo-V2.5 emits from its training-data leakage. V8 added a     #
+# #   guard requiring a <think> opener in the input_ids slice before declaring  #
+# #   reasoning ended, to avoid false positives on chat-template tool-call      #
+# #   examples.                                                                 #
+# #                                                                             #
+# #   The bug: vLLM's parser orchestrator                                       #
+# #   (vllm/parser/abstract_parser.py:parse_delta) calls is_reasoning_end on    #
+# #   a SMALL SLICE of delta-token-ids — a handful of tokens at a time, never   #
+# #   containing the request's <think> opener. With V8's guard requiring the    #
+# #   opener inside that slice, is_reasoning_end always returned False,         #
+# #   state.reasoning_ended stayed False forever, the orchestrator never        #
+# #   handed off to the tool parser, and Droid/OpenCode tool calls came         #
+# #   through as raw XML in the content channel.                                #
+# #                                                                             #
+# # What we use instead (combined):                                             #
+# #   1. repetition_penalty=1.2 in --override-generation-config (HF discussion  #
+# #      #6, S1quence's reply 3) — keeps the Unicode-contamination thought-loop #
+# #      from running away in the first place.                                  #
+# #   2. mimo-scrub-claude-xml-leakage — strips residual `</parameter>`,        #
+# #      `</invoke>`, and math-italic antml-close tags from the streamed SSE   #
+# #      `delta.content` / `delta.reasoning_content` if they still slip out.   #
+# #                                                                             #
+# # If you want to revive this:                                                 #
+# #   The right fix is at the orchestrator level — either pass the cumulative   #
+# #   input_ids to is_reasoning_end (so the opener is always visible), or move  #
+# #   the closer-detection into is_reasoning_end_streaming where the parser     #
+# #   already maintains cumulative `current_text`. The text-based suffix scan   #
+# #   in _mod_extract_reasoning_streaming below is the right primitive — only   #
+# #   the is_reasoning_end hook is wrong.                                       #
+# ###############################################################################
+#
+# Historical implementation notes (kept for context if revived):
+#
 # V7 — Skip-list heuristic for closer detection works. But is_reasoning_end
 #      naively returned True whenever tool_call_token_id was in input_ids,
 #      catching the chat-template's RENDERED tool-call EXAMPLE block when
@@ -10,8 +53,21 @@
 #      treat an unpaired <tool_call> (no matching </tool_call> after it) as
 #      implicit reasoning end. Paired template examples are skipped.
 #      All V7 skip-list heuristic and scan-back logic preserved.
+#      ^ As described above, this approach is itself broken at the
+#        orchestrator boundary. Disabled in startmimo.sh.
 
 set -e
+
+# Refuse to apply unless the caller explicitly opts in. The patch below
+# is broken at the parser orchestrator boundary (see header). Anyone
+# bulk-applying mimo-* mods will skip this one by default.
+if [ "${ALLOW_DEFUNCT_MOD:-0}" != "1" ]; then
+    echo "[mimo-recognize-claude-thinking-close] SKIPPED — defunct, disabled 2026-05-23."
+    echo "  See header of this file for the failure analysis."
+    echo "  To force-apply anyway (e.g. for diagnostic work): ALLOW_DEFUNCT_MOD=1 bash run.sh"
+    exit 0
+fi
+
 VLLM_ROOT="/usr/local/lib/python3.12/dist-packages/vllm"
 PARSER="$VLLM_ROOT/reasoning/qwen3_reasoning_parser.py"
 BACKUP="$PARSER.bak-claude-thinking-close"
