@@ -1,6 +1,27 @@
 #!/bin/bash
 # Drop redundant `function.name=null` from subsequent tool-call deltas.
 #
+# ───────────────────────────────────────────────────────────────────────────
+# UPSTREAM TRACKING — vLLM PR #42969 "[Bugfix] Fix duplicate Qwen3 XML function
+# close recovery" (https://github.com/vllm-project/vllm/pull/42969, OPEN as of
+# 2026-05-29; surfaced in NVIDIA forum thread 370459 #8 by serapis).
+#
+# ROOT CAUSE (confirmed present in our parser 2026-05-29): qwen3xml_tool_parser
+# sets `current_function_open = False` on a </function> close (line ~949) but
+# does NOT clear `current_function_name`. The auto-close/recovery paths
+# (lines ~137/164/196/279/635) all gate on `if self.current_function_name:`,
+# so they treat the just-closed function as still active and emit a SECOND
+# closing brace -> `}}` -> client JSON.parse fails / "not well-formed (invalid
+# token)". This is the bug our STEP 2 (no-op _create_remaining_args_delta) and
+# STEP 3 (_emit_delta dedup) work around at the symptom level.
+#
+# PLAN: once #42969 merges, adopt it as the root-cause fix and RETIRE steps 2
+# and 3 below (the brittle _emit_delta interception). KEEP step 1 — the
+# `name=null` removal is a separate OpenAI-streaming-spec issue #42969 does not
+# touch. Prefer the upstream one-liner over our downstream dedup
+# (cf. feedback_prefer_template_over_parser).
+# ───────────────────────────────────────────────────────────────────────────
+#
 # The qwen3xml_tool_parser emits DeltaFunctionCall(name=None, arguments="...")
 # for every chunk after the first tool-call header. With pydantic
 # `exclude_unset=True`, an EXPLICITLY-set None still serializes as `"name": null`
