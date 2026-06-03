@@ -10,10 +10,11 @@ These mods address compatibility issues encountered when deploying MiMo-V2.5 on 
 2. **Chat template fixes** – Corrects tool-call parsing and reasoning content handling
 3. **MOE config aliasing** – Links RTX PRO 6000 Blackwell configs to GB10
 4. **Reasoning content emission** – Renames `reasoning` field to `reasoning_content` for OpenAI compatibility
-5. **Tool call delta fixes** – Removes problematic `name=null` emissions and empty tool calls
+5. **Tool call delta fixes** – Removes problematic `name=null` emissions (step 1; steps 2/3 retired — superseded by the PR #42969 root fix, #9)
 6. **Claude thinking close recognition** – Improves reasoning end detection for Claude-style thinking
 7. **Empty tool call stripping** – Filters out incomplete tool call deltas
 8. **Claude XML leakage scrubbing** – Strips Anthropic-leaked closing tags from streamed content/reasoning
+9. **Tool-call parser root fix (PR #42969)** – Clears `current_function_name` on function close; fixes multi/sequential tool-call corruption (`}}` / "not well-formed (invalid token)")
 
 ## Installation
 
@@ -47,7 +48,7 @@ bash mods/mimo-alias-moe-configs-gb10/run.sh
 # 4. Reasoning content emission (client compatibility)
 bash mods/mimo-emit-reasoning-content/run.sh
 
-# 5. Tool call delta fixes (removes name=null, deduplicates)
+# 5. Tool call delta fixes (removes name=null only; steps 2/3 retired)
 bash mods/mimo-fix-tool-call-deltas/run.sh
 
 # 6. Claude thinking close recognition — SKIP (defunct, see section 6 below)
@@ -58,6 +59,10 @@ bash mods/mimo-strip-empty-tool-calls/run.sh
 
 # 8. Claude XML leakage scrubbing (strips </parameter>, </invoke>, math-italic antml)
 bash mods/mimo-scrub-claude-xml-leakage/run.sh
+
+# 9. Tool-call parser root fix — clears current_function_name on close (PR #42969).
+#    Apply AFTER #5; it's the root fix that let steps 2/3 of #5 be retired.
+bash mods/mimo-clear-function-name-pr42969/run.sh
 ```
 
 ## Prerequisites
@@ -95,9 +100,10 @@ bash mods/mimo-scrub-claude-xml-leakage/run.sh
 
 ### 5. mimo-fix-tool-call-deltas
 
-**Purpose**: Cleans up malformed tool-call streaming deltas  
-**Problem**: Parser emits `name=null` in continuation deltas, confusing strict validators  
-**Solution**: Strips `name=None` from tool-call deltas and deduplicates immediate duplicate argument fragments  
+**Purpose**: Strips `name=null` from continuation tool-call deltas (OpenAI streaming-spec compliance)  
+**Problem**: Parser emits `DeltaFunctionCall(name=None, ...)` on continuation chunks; pydantic `exclude_unset` still serializes the explicit `None` as `"name": null`, which strict client validators (OpenCode AI-SDK Zod / Droid) reject with "Expected 'function.name' to be a string"  
+**Solution**: Replaces `DeltaFunctionCall(name=None, arguments=...)` with `DeltaFunctionCall(arguments=...)` so `name` stays unset and is omitted  
+**Note (2026-06-02)**: This mod is now **step 1 only**. Its former steps 2 (no-op `_create_remaining_args_delta`) and 3 (`_emit_delta` dedup) were symptom workarounds for the `}}` corruption and have been **retired** — that corruption is fixed at the root by **#9 (`mimo-clear-function-name-pr42969`)**. Verified: multi/sequential tool calls reconstruct to valid JSON with steps 2/3 removed.  
 
 ### 6. mimo-recognize-claude-thinking-close — ⚠️ DEFUNCT, kept for reference
 
@@ -125,3 +131,11 @@ bash mods/mimo-scrub-claude-xml-leakage/run.sh
 **Problem**: MiMo-V2.5's training mix contains Anthropic-conversation leakage. The model intermittently emits `</parameter>`, `</invoke>`, `</function_calls>` into the content channel and corrupted math-italic forms like `</𝑎𝑛𝑡𝑚𝑙:thinking>`, `</𝑎𝑛𝑡𝑚�>`, `</𝑎�>` (U+FFFD) into the reasoning channel
 **Solution**: Wraps `ChatCompletionStreamResponse.model_dump_json` with a tag-scrubbing serializer. Maintains a per-`(request_id, field)` tail buffer so tags split across SSE chunks still get caught. Tags inside legitimate `<tool_call>` blocks are unaffected — by the time content reaches this hook, the tool-call parser has already consumed real tool calls
 **Known limit**: This will also strip these tag literals from code/documentation output. Acceptable trade-off for our use cases (coding agents, not Claude-format docs)
+
+### 9. mimo-clear-function-name-pr42969
+
+**Purpose**: Root-cause fix for tool-call corruption on multi/sequential tool calls (backport of vLLM [PR #42969](https://github.com/vllm-project/vllm/pull/42969))  
+**Problem**: `qwen3xml_tool_parser`'s function-end handler sets `current_function_open = False` but does **not** clear `current_function_name`. On the next `<tool_call>`, the guard `if self.current_function_open or self.current_function_name:` re-fires `_end_element("function")` → a spurious `}` (the `}}` corruption) and desyncs the (reset) expat parser so the following `</tool_call>` throws `not well-formed (invalid token)`. Surfaced in NVIDIA forum thread 370459 #8; confirmed as the live trigger for multi-`read` corruption (e.g. a coding agent reading several files in one turn).  
+**Solution**: Clear `self.current_function_name = None` when the function closes.  
+**Impact**: Fixes both the `}}` bug and the multi-call `not well-formed` parse failures with one change, and made steps 2/3 of #5 redundant (now retired). Apply **after** #5.  
+**Upstream**: PR #42969 was open at backport time; replace this mod with the upstream commit once it merges.  
